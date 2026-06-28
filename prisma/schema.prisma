@@ -1,0 +1,187 @@
+// Prisma schema. Postgres (e.g. Neon via Vercel Postgres) in an EU region.
+// DATABASE_URL is set by Vercel; locally put it in .env.local.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// A single contract record. Status and type are stored as plain strings whose
+// allowed values live in src/lib/constants.ts (Norwegian labels mapped there).
+model Contract {
+  id     Int    @id @default(autoincrement())
+  title  String
+  type   String // see CONTRACT_TYPES
+  status String // see STATUSES
+
+  // Counterparty (motpart). Kept as a snapshot even when a customer is linked.
+  counterpartyName    String
+  counterpartyPhone   String?
+  counterpartyEmail   String?
+  counterpartyAddress String?
+
+  // Optional link to a CRM customer.
+  customerId Int?
+  customer   Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  // Dates and money
+  startDate  DateTime?
+  endDate    DateTime? // slutt-/fornyelsesdato (the date the dashboard watches)
+  signedDate DateTime?
+  amount     Float?
+  amountUnit String? // e.g. "per oppdrag", "per måned", "engang", "fastpris"
+
+  // Flags and free text
+  autoRenew Boolean @default(false)
+  notes     String?
+
+  // Generated contract document (filled-in template body, plain text/markdown)
+  documentBody String?
+
+  // Attached signed PDF. Stored in the DB so it works on serverless hosting
+  // (no local filesystem). filePath is kept for backward compatibility / legacy
+  // local files; new uploads use fileData.
+  fileName String?
+  filePath String? // legacy: relative path inside /uploads (local only)
+  fileData Bytes? // PDF bytes (used on hosted/serverless deploys)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  changes ChangeLog[]
+}
+
+// Reusable Norwegian contract templates with fill-in fields.
+model Template {
+  id           String  @id @default(cuid())
+  name         String
+  type         String // contract type this template produces
+  amountUnit   String?
+  defaultAmount Float?
+  autoRenew    Boolean @default(false)
+
+  // JSON array of field definitions: [{ key, label, type, placeholder }]
+  fields String
+
+  // Document body with {{key}} placeholders that get filled in.
+  body String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Lightweight change log (who/what/when).
+model ChangeLog {
+  id         Int      @id @default(autoincrement())
+  contractId Int?
+  action     String
+  summary    String
+  actor      String? // username of the logged-in user, when known
+  createdAt  DateTime @default(now())
+
+  contract Contract? @relation(fields: [contractId], references: [id], onDelete: Cascade)
+}
+
+// One of the two owners. Password is stored as a scrypt hash ("salt:hash").
+model User {
+  id           Int       @id @default(autoincrement())
+  username     String    @unique
+  name         String
+  passwordHash String
+  // Brute-force protection: count failures and lock the account temporarily.
+  failedAttempts Int       @default(0)
+  lockedUntil    DateTime?
+  createdAt    DateTime  @default(now())
+  sessions     Session[]
+}
+
+// Server-side session; the cookie only holds the random `id`.
+model Session {
+  id        String   @id
+  userId    Int
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// CRM: a customer/contact. Type and status values live in src/lib/crm.ts.
+model Customer {
+  id      Int    @id @default(autoincrement())
+  name    String
+  type    String // see CUSTOMER_TYPES (privat/bedrift/borettslag/sameie/annet)
+  status  String // see CUSTOMER_STATUSES (prospekt/aktiv/inaktiv)
+  phone   String?
+  email   String?
+  address String?
+  notes   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  contracts  Contract[]
+  activities Activity[]
+}
+
+// CRM: a logged interaction or a follow-up task tied to a customer.
+model Activity {
+  id         Int       @id @default(autoincrement())
+  customerId Int
+  type       String // see ACTIVITY_TYPES (samtale/epost/møte/notat/oppgave)
+  summary    String
+  date       DateTime  @default(now()) // when it happened / is scheduled
+  followUpAt DateTime? // optional follow-up reminder date
+  done       Boolean   @default(false) // for follow-up tasks
+  actor      String? // username of the logged-in user
+  createdAt  DateTime  @default(now())
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+}
+
+// Sikkerhet & etterlevelse: a security / compliance control to track and follow up.
+// Allowed values for domain/category/status/risk live in src/lib/security.ts.
+model ControlItem {
+  id          Int       @id @default(autoincrement())
+  title       String
+  domain      String // it_sikkerhet | drift_hms
+  category    String // see CONTROL_CATEGORIES
+  status      String // ikke_startet | paagaar | paa_plass | trenger_oppfolging | utlopt
+  riskLevel   String // lav | middels | hoy
+  description String?
+  owner       String? // who is responsible
+  reviewDate  DateTime? // next review / deadline the dashboard watches
+  notes       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  assessments Assessment[]
+}
+
+// A saved AI risk assessment ("den ærlige kritikeren" for sikkerhet & jus).
+model Assessment {
+  id        Int      @id @default(autoincrement())
+  title     String
+  domain    String // it_sikkerhet | drift_hms | begge
+  situation String // the user's described situation/decision/measure
+  result    String // the model's structured assessment (markdown)
+  model     String // model id used
+  actor     String? // username of the logged-in user
+  createdAt DateTime @default(now())
+
+  controlItemId Int?
+  controlItem   ControlItem? @relation(fields: [controlItemId], references: [id], onDelete: SetNull)
+}
+
+// Per-user daily counter for AI assessments, to cap cost/abuse on the hosted app.
+model AiUsage {
+  id    Int    @id @default(autoincrement())
+  actor String // username
+  day   String // YYYY-MM-DD (UTC)
+  count Int    @default(0)
+
+  @@unique([actor, day])
+}
